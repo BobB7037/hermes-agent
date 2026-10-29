@@ -1,7 +1,7 @@
 #!/bin/sh
 # Hermes process supervisor: one per Hermes process, reaping the process groups it owns once it dies.
 #
-# Usage: sh process_supervisor.sh <parent-pgid>, spawned with start_new_session=True and stdin a
+# Usage: sh process_supervisor.sh <parent-pgid> [<spool-dir>], spawned with start_new_session=True and stdin a
 # pipe whose only write end Hermes holds (hermes_cli/process_identity.py, "owner-death supervisor").
 # stdin carries one command per line:
 #     register <pgid>     reap this process group when Hermes dies
@@ -14,6 +14,9 @@
 # about 0.5 MB USS where an idle interpreter costs about 8 MB. It must also never import Hermes:
 # it runs after Hermes may already be dead.
 #
+# When <spool-dir> exists (a gateway exports telemetry for this home), a reap leaves one content-free
+# record there (agent/monitoring/managed_processes.py): how many groups, and whether any needed SIGKILL.
+#
 # Malformed lines are skipped: a corrupt line must not cost the reaping guarantee for every other
 # group. Groups that are never a valid target (pgid <= 1, our own, Hermes's own) are refused at
 # registration, so a caller bug costs one unreaped child, never the Hermes process tree.
@@ -22,6 +25,7 @@
 
 trap '' INT HUP  # a dying parent's SIGINT/SIGHUP must not preempt the reap: EOF is the only signal
 parent=$1
+spool=${2:-}
 # Every register line compares against it: a bad value would silently refuse every registration.
 case $parent in ''|*[!0-9]*) echo "hermes process supervisor: bad parent pgid '$parent'; refusing to run" >&2; exit 2 ;; esac
 # Run inside the parent's group, a killpg of the parent would take us down before we reap.
@@ -43,14 +47,27 @@ while IFS=' ' read -r verb pg rest; do
       reg=$keep ;;
   esac
 done
+reaped=0
+for g in $reg; do reaped=$((reaped + 1)); done
+# After the reap, never before it: a record costs a fork and a write, the reap must not wait on them.
+report() {
+  [ "$reaped" -gt 0 ] && [ -n "$spool" ] && [ -d "$spool" ] || return 0
+  ts=$(command -p date +%s 2>/dev/null) || ts=
+  case $ts in ''|0|*[!0-9]*) ts=0 ;; *) ts=${ts}000000000 ;; esac  # 0: the reader stamps it
+  tmp="$spool/.supervisor-$$.tmp"
+  printf '{"event":"managed_process","subsystem":"owned_children","action":"orphan_reap","outcome":"%s","actor":"supervisor","count":%s,"ts_ns":%s}\n' \
+    "$1" "$reaped" "$ts" >"$tmp" 2>/dev/null && mv -f "$tmp" "$spool/$ts-$$.json" 2>/dev/null || rm -f "$tmp" 2>/dev/null
+  return 0
+}
 for g in $reg; do kill -TERM -"$g" 2>/dev/null; done
 for _ in 1 2 3; do
   live=''
   for g in $reg; do kill -0 -"$g" 2>/dev/null && live="$live $g"; done
   reg=$live
-  [ -n "$reg" ] || exit 0
+  [ -n "$reg" ] || { report terminated; exit 0; }
   # The default PATH: a broken PATH must not turn the TERM grace into an instant KILL.
   command -p sleep 1 2>/dev/null || sleep 1
 done
 for g in $reg; do kill -KILL -"$g" 2>/dev/null; done
+report killed
 exit 0

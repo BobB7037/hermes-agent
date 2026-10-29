@@ -203,6 +203,59 @@ def test_escalates_to_sigkill_for_a_group_that_ignores_sigterm():
         supervisor.wait(timeout=10)
 
 
+@pytest.mark.parametrize("ignores_term", [False, True])
+def test_a_reap_leaves_one_content_free_record_while_a_gateway_spools_for_this_home(tmp_path, ignores_term):
+    """The reap happens after its owner died, where no exporter runs: it leaves a record in the spool the
+    exporting gateway drains (how many groups, and whether SIGKILL was needed). Nothing without a spool."""
+    from agent.monitoring import managed_processes
+
+    managed_processes.set_spooling([tmp_path], True)
+    code = "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); print('armed', flush=True); time.sleep(300)" \
+        if ignores_term else "import time; print('armed', flush=True); time.sleep(300)"
+    victims = [subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE, text=True, start_new_session=True)
+               for _ in range(2)]
+    supervisor = subprocess.Popen([*_supervisor_argv(os.getpgid(0)), str(managed_processes.spool_dir(tmp_path))],
+                                  stdin=subprocess.PIPE, text=True, start_new_session=True)
+    try:
+        for victim in victims:
+            assert victim.stdout.readline().strip() == "armed"
+            supervisor.stdin.write(f"register {victim.pid}\n")
+        supervisor.stdin.close()
+        assert _wait_exited(supervisor, timeout=20)
+        assert all(_wait_exited(victim) for victim in victims)
+        (event,) = managed_processes.drain_spool([tmp_path])
+        assert (event.subsystem, event.action, event.outcome, event.actor, event.count) == (
+            "owned_children", "orphan_reap", "killed" if ignores_term else "terminated", "supervisor", 2)
+        assert event.ts_ns > 1_600_000_000 * 10**9
+    finally:
+        for victim in victims:
+            _kill(victim.pid)
+            victim.wait(timeout=10)
+        _kill(supervisor.pid)
+        supervisor.wait(timeout=10)
+
+
+def test_a_reap_records_nothing_without_a_spool_or_with_nothing_registered(tmp_path):
+    victim = subprocess.Popen(_VICTIM, start_new_session=True)
+    absent = tmp_path / "monitoring" / "spool"
+    try:
+        supervisor = subprocess.Popen([*_supervisor_argv(os.getpgid(0)), str(absent)], stdin=subprocess.PIPE,
+                                      text=True, start_new_session=True)
+        supervisor.stdin.write(f"register {victim.pid}\n")
+        supervisor.stdin.close()
+        assert _wait_exited(supervisor) and _wait_exited(victim)
+        assert not absent.exists(), "the supervisor must never create the spool: export is off for this home"
+        absent.mkdir(parents=True)
+        empty = subprocess.Popen([*_supervisor_argv(os.getpgid(0)), str(absent)], stdin=subprocess.PIPE, text=True,
+                                 start_new_session=True)
+        empty.stdin.close()  # a release with nothing registered is not a reap
+        assert _wait_exited(empty)
+        assert list(absent.iterdir()) == []
+    finally:
+        _kill(victim.pid)
+        victim.wait(timeout=10)
+
+
 def test_the_term_grace_holds_even_with_a_broken_path():
     """``sleep`` is not a dash builtin: with PATH unusable the grace loop skipped its sleeps and the
     KILL landed at once, cutting short a child's TERM cleanup."""
@@ -615,6 +668,45 @@ def test_a_supervisor_that_cannot_start_is_not_fatal(monkeypatch, all_groups_ali
     assert process_identity._supervisor is None
 
 
+def test_a_supervisor_that_cannot_spawn_is_reported(monkeypatch, all_groups_alive):
+    """Losing the owner-death safety net is silent for the user; operators see it as an event."""
+    from agent.monitoring import managed_processes
+    seen = []
+    monkeypatch.setattr(managed_processes, "record", lambda *a, **k: seen.append((a, k)))
+
+    def no_sh(*_a, **_k):
+        raise OSError(2, "No such file or directory")
+
+    monkeypatch.setattr(process_identity.subprocess, "Popen", no_sh)
+    process_identity.own_process_groups([111])
+    assert seen == [(("owned_children", "supervisor_unavailable", "spawn_failed"), {"actor": "owner", "count": None})]
+
+
+def test_supervisor_telemetry_can_never_cost_the_supervisor(monkeypatch):
+    """The spool path is resolved inside the supervisor spawn: a broken monitoring import must cost the
+    record, not the safety net."""
+    import builtins
+    real_import = builtins.__import__
+
+    def broken(name, *a, **k):
+        if name.startswith("agent.monitoring"):
+            raise ImportError("monitoring unavailable")
+        return real_import(name, *a, **k)
+
+    child = subprocess.Popen(_VICTIM, start_new_session=True)
+    try:
+        with monkeypatch.context() as patched:
+            patched.setattr(builtins, "__import__", broken)
+            process_identity.own_process_groups([child.pid])
+        proc = process_identity._supervisor
+        assert proc is not None and proc.poll() is None, "the supervisor did not start without telemetry"
+        proc.stdin.close()  # and it still reaps
+        assert _wait_exited(child), "the supervisor started without telemetry did not reap"
+    finally:
+        _kill(child.pid)
+        child.wait(timeout=10)
+
+
 @contextlib.contextmanager
 def _stdio_connection(child_pid, fake_supervisor):
     """Drive the real MCPServerTask._run_stdio with a known spawned child.
@@ -875,6 +967,10 @@ def test_a_supervisor_killed_on_its_own_is_restarted_with_every_group_replayed(m
     restarted however young the supervisor is (a new one starts after every idle period)."""
     import psutil
 
+    from agent.monitoring import managed_processes
+    exits = []
+    monkeypatch.setattr(managed_processes, "record",
+                        lambda subsystem, action, outcome, **k: exits.append((action, outcome, k.get("count"))))
     child = subprocess.Popen(_VICTIM, start_new_session=True)
     try:
         process_identity.own_process_groups([child.pid])
@@ -886,6 +982,7 @@ def test_a_supervisor_killed_on_its_own_is_restarted_with_every_group_replayed(m
         wait_until(lambda: not psutil.pid_exists(first.pid), timeout=10, what="the killed supervisor reaped")
         assert child.poll() is None, "restarting the supervisor touched a live group"
 
+        assert ("supervisor_exit", "restarted", 1) in exits, "a supervisor that died and was restarted went unreported"
         second.stdin.close()  # the EOF our death sends: the replayed group must be reaped
         wait_until(lambda: child.poll() is not None, timeout=15,
                    what="the group registered before the restart killed by the replacement")

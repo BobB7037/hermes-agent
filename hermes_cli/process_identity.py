@@ -854,16 +854,36 @@ def _spawn_supervisor():
         # which would kill the supervisor before it could reap anything. close_fds keeps the write
         # end of every OTHER pipe we hold out of it, so it never delays another child's EOF.
         proc = subprocess.Popen(
-            [_POSIX_SH, str(_SUPERVISOR_SCRIPT), str(os.getpgid(0))],
+            [_POSIX_SH, str(_SUPERVISOR_SCRIPT), str(os.getpgid(0)), _telemetry_spool()],
             stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             start_new_session=True, close_fds=True, text=True, encoding="utf-8")
     except Exception:
         # Never let supervisor bookkeeping block a real child: graceful shutdown paths still reap
         # normally; only the ungraceful-exit safety net is lost.
         logger.debug("Could not start the owner-death supervisor", exc_info=True)
+        _record_supervisor_event("supervisor_unavailable", "spawn_failed")
         return None
     _watch_supervisor(proc)
     return proc
+
+
+def _telemetry_spool() -> str:
+    """Where the supervisor leaves its reap record; it writes only while the directory exists. Telemetry
+    must never cost the supervisor: any failure here means no record, not no supervisor."""
+    try:
+        from agent.monitoring.managed_processes import spool_dir
+        return str(spool_dir())
+    except Exception:
+        logger.debug("No telemetry spool for the owner-death supervisor", exc_info=True)
+        return ""
+
+
+def _record_supervisor_event(action: str, outcome: str, count: Optional[int] = None) -> None:
+    try:
+        from agent.monitoring.managed_processes import OWNED_CHILDREN, record
+        record(OWNED_CHILDREN, action, outcome, actor="owner", count=count)
+    except Exception:
+        logger.debug("owner-death supervisor telemetry failed", exc_info=True)
 
 
 # A supervisor that dies sooner than this after starting may not be able to stay up (a broken install:
@@ -907,6 +927,8 @@ def _watch_supervisor(proc) -> None:
                 "owner-death supervisor exited (status %s) with %d process group(s) registered; %s",
                 proc.returncode, len(_supervised_pgids),
                 "restarting it" if restart else "it could not stay up, retrying at the next registration")
+            _record_supervisor_event("supervisor_exit", "restarted" if restart else "not_restarted",
+                                     count=len(_supervised_pgids))
             if restart:
                 _starting_young_restart = young_signal
                 try:
@@ -1010,6 +1032,12 @@ def _prune_dead_supervised_pgids() -> set:
             pass
     _supervised_pgids.difference_update(stale)
     return stale
+
+
+def supervised_group_count() -> int:
+    """Process groups this process's owner-death supervisor currently covers (exported as a gauge)."""
+    with _supervisor_lock:
+        return len(_supervised_pgids)
 
 
 def own_process_groups(pgids) -> None:
