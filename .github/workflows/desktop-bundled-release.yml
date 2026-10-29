@@ -46,8 +46,8 @@ name: Desktop Bundled Release
 # carry release files. Non-publishing tag builds leave output on the runner.
 # Commit builds stage under releases/commit/<sha>/ and write a run summary.
 # They never publish a release, updater feed, Store submission, or APT channel.
-# Admitted channel requests reuse those native build/smoke legs with read-only
-# dependency caches. Their receipts use releases/channel-builds/<id>/; only the
+# Channel claims reuse the native build/smoke legs, with cache save steps skipped.
+# Legacy tagless channel receipts use releases/channel-builds/<id>/; only the
 # trusted publish-channel controller may CAS the channel after all smoke passes.
 #
 # Payload staging is `hermes pm bundle` on the native runner. There is
@@ -481,7 +481,7 @@ jobs:
 
       # Check out the SHA the validate job admitted — never the tag ref,
       # which a force-push can move between jobs. This is the privileged
-      # (release-signing) build; it must run the reviewed bytes.
+      # (release-signing) build; preview claims need not contain reviewed code.
       - uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a  # v1
         with:
           ref: ${{ needs.validate.outputs.sha }}
@@ -869,7 +869,7 @@ jobs:
 
       # Check out the SHA the validate job admitted — never the tag ref,
       # which a force-push can move between jobs. This is the privileged
-      # (release-signing) build; it must run the reviewed bytes.
+      # (release-signing) build; preview claims need not contain reviewed code.
       - uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a  # v1
         with:
           ref: ${{ needs.validate.outputs.sha }}
