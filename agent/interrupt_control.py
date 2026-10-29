@@ -53,6 +53,17 @@ def interrupted_during_api_call_reason(agent) -> str:
     return f"interrupted_during_api_call({issuer})" if issuer else "interrupted_during_api_call"
 
 
+# Exit reasons that carry a system issuer: ``interrupted_during_api_call_reason`` above and the
+# between-iterations break in ``turn_iteration_prep`` (``interrupted_by_system(<issuer>)``).
+_SYSTEM_INTERRUPT_EXIT_PREFIXES = ("interrupted_by_system(", "interrupted_during_api_call(")
+
+
+def is_system_interrupt_exit(turn_exit_reason: Optional[str]) -> bool:
+    """Whether a turn exit reason names a system producer (parent delegation, watchdog, shutdown)
+    rather than the user, so consumers never book it as a user stop."""
+    return str(turn_exit_reason or "").strip().lower().startswith(_SYSTEM_INTERRUPT_EXIT_PREFIXES)
+
+
 def _fence_cancel_before_commit(fence, *, when_in_flight: bool, failure_log: str) -> None:
     """Call ``type(fence).cancel_before_commit(fence)`` when ``commit_in_flight`` matches.
 
