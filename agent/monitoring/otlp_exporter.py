@@ -178,6 +178,7 @@ _KEEP_BY_KIND: dict[str, tuple[str, ...]] = {
     ),
     "gateway_diagnostic": ("name", "subsystem", "error_class", "error_code", "platform", "old_state", "new_state", "version", "severity"),
     "cron_execution": ("status", "job_key", "source", "duration_ms", "delivery_outcome", "error_class"),
+    "managed_process": ("subsystem", "action", "outcome", "actor", "reason", "count"),
 }
 
 
