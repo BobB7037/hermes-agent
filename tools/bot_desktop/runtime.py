@@ -512,17 +512,28 @@ def stop_if_idle(launcher: Optional[tuple[int, float]] = None) -> bool:
         return _idle_due(launcher) is not None
 
     logger.info("Bot Desktop for profile %s idle for %.0f min; stopping", _profile_name(), idle / 60)
-    if not stop(still_due=still_due):
+    from agent.monitoring.managed_processes import BOT_DESKTOP, record
+    actor = "screen" if launcher is not None else "watcher"
+    stopped = stop(still_due=still_due)
+    abandoned = held if held is not None and held.holder == _bd_lease.HUMAN else None
+    # No reason when stop() refused before judging again (nothing ran under the lock).
+    record(BOT_DESKTOP, "idle_stop", "stopped" if stopped else "kept", actor=actor,
+           reason=None if held is None else "idle" if abandoned is None else "abandoned_lease")
+    if not stopped:
         return False
-    if held is not None and held.holder == _bd_lease.HUMAN:
+    if abandoned is not None:
         # An abandoned human lease stopped the screen. Left in place it would fence the agent out of the next
         # screen ("a human has control"); only the lease generation judged abandoned goes, so any takeover
         # since (another viewer, or the same one handing back and taking over again) is kept.
         try:
-            _bd_lease.release(held.viewer_id, epoch=held.epoch)
+            after = _bd_lease.release(abandoned.viewer_id, epoch=abandoned.epoch)
         except OSError as exc:  # the screen is already stopped: a full or read-only home must not undo that
             logger.warning("Bot Desktop for profile %s stopped, but its abandoned lease was not released: %s",
                            _profile_name(), exc)
+            outcome = "write_failed"
+        else:
+            outcome = "released" if after.holder == _bd_lease.AGENT else "kept_newer"
+        record(BOT_DESKTOP, "lease_handback", outcome, actor=actor)
     return True
 
 

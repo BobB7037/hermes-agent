@@ -305,7 +305,17 @@ if [[ -n "${HERMES_BD_IDLE_CMD:-}" ]]; then
       [[ "$delay" =~ ^[0-9]+$ ]] || delay=300
       sleep "$delay" & sleeper=$!
       # Killed (status > 128): check now. A sleep that cannot sleep at all would spin the check: give up.
-      wait "$sleeper" || (( $? > 128 )) || { echo "idle self-stop: sleep failed; off for this screen" >&2; exit 0; }
+      wait "$sleeper" || (( $? > 128 )) || {
+        echo "idle self-stop: sleep failed; off for this screen" >&2
+        # Telemetry (agent/monitoring/managed_processes.py), only while a gateway exports for this home.
+        spool="${HERMES_BD_HOME:-}/monitoring/spool"
+        if [[ -n "${HERMES_BD_HOME:-}" && -d "$spool" ]]; then
+          ts=$(date +%s 2>/dev/null) && [[ "$ts" =~ ^[1-9][0-9]*$ ]] && ts="${ts}000000000" || ts=0
+          printf '{"event":"managed_process","subsystem":"bot_desktop","action":"self_stop_off","outcome":"sleep_failed","actor":"screen","ts_ns":%s}\n' \
+            "$ts" >"$spool/.launcher-$$.tmp" 2>/dev/null && mv -f "$spool/.launcher-$$.tmp" "$spool/$ts-$$.json" 2>/dev/null
+        fi
+        exit 0
+      }
       sleeper=
       kill -0 "$$" 2>/dev/null || exit 0
       eval "set -- $HERMES_BD_IDLE_CMD"
